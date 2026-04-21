@@ -6,6 +6,8 @@ use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
 mod config;
+mod mgmt;
+mod metrics;
 mod proxy;
 
 use proxy::{AppState, BackendState};
@@ -32,7 +34,10 @@ async fn main() -> Result<()> {
         let cred = config::load_credentials(&backend.credentials_file)
             .with_context(|| format!("loading credentials for backend '{}'", backend.name))?;
         if cred.is_expired() {
-            tracing::warn!("token for '{}' is already expired — will reload on first request", backend.name);
+            tracing::warn!(
+                "token for '{}' is already expired — will reload on first request",
+                backend.name
+            );
         }
         backends.insert(
             backend.name.clone(),
@@ -43,22 +48,43 @@ async fn main() -> Result<()> {
         );
     }
 
+    let faults = cfg.fault_injection.as_map();
+    if !faults.is_empty() {
+        tracing::warn!(
+            "fault injection enabled for backends: {:?}",
+            faults.keys().collect::<Vec<_>>()
+        );
+    }
+
+    let backend_names: Vec<String> = cfg.backends.iter().map(|b| b.name.clone()).collect();
+    let metrics = metrics::Metrics::new(&backend_names);
+
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("building HTTP client")?;
 
-    let faults = cfg.fault_injection.as_map();
-    if !faults.is_empty() {
-        tracing::warn!("fault injection enabled for backends: {:?}", faults.keys().collect::<Vec<_>>());
-    }
-
     let state = Arc::new(AppState {
         config: cfg.clone(),
         backends,
-        faults: tokio::sync::RwLock::new(faults),
+        faults: RwLock::new(faults),
+        metrics,
         client,
     });
+
+    // Start mgmt server if CLAUDE_PROXY_MGMT is set
+    if let Ok(mgmt_addr) = std::env::var("CLAUDE_PROXY_MGMT") {
+        let mgmt_state = Arc::clone(&state);
+        let mgmt_listener = tokio::net::TcpListener::bind(&mgmt_addr)
+            .await
+            .with_context(|| format!("binding mgmt server to {mgmt_addr}"))?;
+        tracing::info!("mgmt API listening on {mgmt_addr}");
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(mgmt_listener, mgmt::router(mgmt_state)).await {
+                tracing::error!("mgmt server error: {e}");
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/{*path}", any(proxy::proxy_handler))

@@ -11,6 +11,7 @@ use rand::Rng;
 use tokio::sync::RwLock;
 
 use crate::config::{load_credentials, Config, FaultRule, OAuthCredential};
+use crate::metrics::Metrics;
 
 pub struct BackendState {
     pub credentials_file: String,
@@ -22,6 +23,7 @@ pub struct AppState {
     pub backends: HashMap<String, Arc<BackendState>>,
     /// Fault rules keyed by backend name; RwLock so mgmt API can update at runtime.
     pub faults: RwLock<HashMap<String, FaultRule>>,
+    pub metrics: Arc<Metrics>,
     pub client: reqwest::Client,
 }
 
@@ -57,14 +59,19 @@ pub async fn proxy_handler(
             continue;
         };
 
+        state.metrics.inc_requests(backend_name);
+
         // Fault injection — check before touching real backend
         {
             let faults = state.faults.read().await;
             if let Some(rule) = faults.get(backend_name) {
                 if rand::rng().random::<f64>() < rule.rate {
                     tracing::warn!(%backend_name, status = rule.status, "fault injected");
+                    state.metrics.inc_faults();
+                    state.metrics.set_last_status(backend_name, rule.status);
                     if state.config.failover.triggers.contains(&rule.status) {
-                        continue; // counts as a trigger, try next backend
+                        state.metrics.inc_failovers();
+                        continue;
                     }
                     return StatusCode::from_u16(rule.status)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
@@ -130,9 +137,12 @@ pub async fn proxy_handler(
                 }
                 if state.config.failover.triggers.contains(&status) {
                     tracing::warn!(%backend_name, %status, "trigger status, trying next backend");
+                    state.metrics.set_last_status(backend_name, status);
+                    state.metrics.inc_failovers();
                     continue;
                 }
                 tracing::info!(%backend_name, %status, "response");
+                state.metrics.set_last_status(backend_name, status);
                 return stream_response(resp).await;
             }
             Err(e) => {
