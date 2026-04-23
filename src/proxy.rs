@@ -13,6 +13,10 @@ use tokio::sync::RwLock;
 use crate::config::{load_credentials, Config, FaultRule, OAuthCredential};
 use crate::metrics::Metrics;
 
+/// Anthropic OAuth beta flag required when presenting an OAuth bearer to api.anthropic.com.
+/// Without this header, the upstream rejects with 401 even on a valid, in-expiry token.
+const OAUTH_BETA: &str = "oauth-2025-04-20";
+
 pub struct BackendState {
     pub credentials_file: String,
     pub token: RwLock<OAuthCredential>,
@@ -103,7 +107,7 @@ pub async fn proxy_handler(
             .request(parts.method.clone(), &url)
             .headers(forward_headers.clone())
             .header("Authorization", format!("Bearer {token}"))
-            .header("anthropic-beta", "oauth-2025-04-20")
+            .header("anthropic-beta", OAUTH_BETA)
             .body(body_bytes.clone());
 
         match builder.send().await {
@@ -117,7 +121,7 @@ pub async fn proxy_handler(
                         .request(parts.method.clone(), &url)
                         .headers(forward_headers.clone())
                         .header("Authorization", format!("Bearer {fresh_token}"))
-                        .header("anthropic-beta", "oauth-2025-04-20")
+                        .header("anthropic-beta", OAUTH_BETA)
                         .body(body_bytes.clone())
                         .send()
                         .await;
