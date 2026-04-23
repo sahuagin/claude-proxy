@@ -103,6 +103,7 @@ pub async fn proxy_handler(
             .request(parts.method.clone(), &url)
             .headers(forward_headers.clone())
             .header("Authorization", format!("Bearer {token}"))
+            .header("anthropic-beta", "oauth-2025-04-20")
             .body(body_bytes.clone());
 
         match builder.send().await {
@@ -116,6 +117,7 @@ pub async fn proxy_handler(
                         .request(parts.method.clone(), &url)
                         .headers(forward_headers.clone())
                         .header("Authorization", format!("Bearer {fresh_token}"))
+                        .header("anthropic-beta", "oauth-2025-04-20")
                         .body(body_bytes.clone())
                         .send()
                         .await;
