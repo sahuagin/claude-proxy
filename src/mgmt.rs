@@ -10,7 +10,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::config::{load_credentials, FaultRule};
-use crate::proxy::AppState;
+use crate::proxy::{AppState, BackendAuth};
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -26,19 +26,30 @@ async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     struct BackendStatus {
         name: String,
         base_url: String,
-        token_expires_at_ms: u64,
-        token_expired: bool,
+        auth: &'static str,
+        /// OAuth-only fields; `None` for api_key backends.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token_expires_at_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token_expired: Option<bool>,
     }
 
     let mut backends = vec![];
     for b in &state.config.backends {
         if let Some(bs) = state.backends.get(&b.name) {
-            let cred = bs.token.read().await;
+            let (auth, expires, expired) = match &bs.auth {
+                BackendAuth::Oauth { token, .. } => {
+                    let cred = token.read().await;
+                    ("oauth", Some(cred.expires_at), Some(cred.is_expired()))
+                }
+                BackendAuth::ApiKey { .. } => ("api_key", None, None),
+            };
             backends.push(BackendStatus {
                 name: b.name.clone(),
                 base_url: b.base_url.clone(),
-                token_expires_at_ms: cred.expires_at,
-                token_expired: cred.is_expired(),
+                auth,
+                token_expires_at_ms: expires,
+                token_expired: expired,
             });
         }
     }
@@ -112,16 +123,48 @@ async fn reload(
             Json(serde_json::json!({"error": format!("backend '{}' not found", req.backend)})),
         );
     };
-    match load_credentials(&backend.credentials_file) {
-        Ok(cred) => {
-            let expires_at = cred.expires_at;
-            *backend.token.write().await = cred;
-            tracing::info!(backend = %req.backend, "credentials reloaded via mgmt API");
-            (StatusCode::OK, Json(serde_json::json!({"reloaded": req.backend, "expires_at_ms": expires_at})))
-        }
-        Err(e) => {
-            tracing::error!(backend = %req.backend, "reload failed: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})))
-        }
+    match &backend.auth {
+        BackendAuth::Oauth {
+            credentials_file,
+            token,
+        } => match load_credentials(credentials_file) {
+            Ok(cred) => {
+                let expires_at = cred.expires_at;
+                *token.write().await = cred;
+                tracing::info!(backend = %req.backend, "OAuth credentials reloaded via mgmt API");
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "reloaded": req.backend,
+                        "auth": "oauth",
+                        "expires_at_ms": expires_at,
+                    })),
+                )
+            }
+            Err(e) => {
+                tracing::error!(backend = %req.backend, "OAuth reload failed: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+            }
+        },
+        BackendAuth::ApiKey { key } => match state.config.resolve_backend_key(&req.backend) {
+            Ok(new_key) => {
+                *key.write().await = new_key.trim().to_string();
+                tracing::info!(backend = %req.backend, "api_key reloaded via mgmt API");
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({"reloaded": req.backend, "auth": "api_key"})),
+                )
+            }
+            Err(e) => {
+                tracing::error!(backend = %req.backend, "api_key reload failed: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+            }
+        },
     }
 }

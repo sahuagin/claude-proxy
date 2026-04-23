@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::State,
     http::{HeaderMap, HeaderName, Request, Response, StatusCode},
     response::IntoResponse,
@@ -17,9 +17,18 @@ use crate::metrics::Metrics;
 /// Without this header, the upstream rejects with 401 even on a valid, in-expiry token.
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 
+pub enum BackendAuth {
+    Oauth {
+        credentials_file: String,
+        token: RwLock<OAuthCredential>,
+    },
+    ApiKey {
+        key: RwLock<String>,
+    },
+}
+
 pub struct BackendState {
-    pub credentials_file: String,
-    pub token: RwLock<OAuthCredential>,
+    pub auth: BackendAuth,
 }
 
 pub struct AppState {
@@ -63,6 +72,14 @@ pub async fn proxy_handler(
             continue;
         };
 
+        // Path-prefix allowlist. Skip backends whose upstream isn't qualified
+        // to answer this path (e.g. don't offer /oauth/token to OpenRouter).
+        let allowed = backend_cfg.effective_allowed_path_prefixes();
+        if !allowed.is_empty() && !allowed.iter().any(|p| path_and_query.starts_with(p)) {
+            tracing::debug!(%backend_name, path = %path_and_query, "path not in allowlist, skipping");
+            continue;
+        }
+
         state.metrics.inc_requests(backend_name);
 
         // Fault injection — check before touching real backend
@@ -84,17 +101,6 @@ pub async fn proxy_handler(
             }
         }
 
-        let token = {
-            let cred = backend.token.read().await;
-            if cred.is_expired() {
-                drop(cred);
-                tracing::info!(%backend_name, "token expired, reloading credentials");
-                reload_token(backend).await
-            } else {
-                cred.access_token.clone()
-            }
-        };
-
         let url = format!(
             "{}{}",
             backend_cfg.base_url.trim_end_matches('/'),
@@ -102,77 +108,133 @@ pub async fn proxy_handler(
         );
         tracing::debug!(%backend_name, %url, "forwarding request");
 
-        let builder = state
-            .client
-            .request(parts.method.clone(), &url)
-            .headers(forward_headers.clone())
-            .header("Authorization", format!("Bearer {token}"))
-            .header("anthropic-beta", OAUTH_BETA)
-            .body(body_bytes.clone());
+        let forward_body = if backend_cfg.model_map.is_empty() {
+            body_bytes.clone()
+        } else {
+            rewrite_model(&body_bytes, &backend_cfg.model_map)
+        };
 
-        match builder.send().await {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                if status == 401 {
-                    tracing::warn!(%backend_name, "got 401, reloading credentials and retrying");
-                    let fresh_token = reload_token(backend).await;
-                    let retry = state
-                        .client
-                        .request(parts.method.clone(), &url)
-                        .headers(forward_headers.clone())
-                        .header("Authorization", format!("Bearer {fresh_token}"))
-                        .header("anthropic-beta", OAUTH_BETA)
-                        .body(body_bytes.clone())
-                        .send()
-                        .await;
-                    match retry {
-                        Ok(r) if r.status().as_u16() != 401 => {
-                            let s = r.status().as_u16();
-                            if state.config.failover.triggers.contains(&s) {
-                                tracing::warn!(%backend_name, %s, "trigger after refresh, trying next");
+        let send_once = |auth_header: String, add_oauth_beta: bool, body: Bytes| {
+            let mut b = state
+                .client
+                .request(parts.method.clone(), &url)
+                .headers(forward_headers.clone())
+                .header("Authorization", auth_header)
+                .body(body);
+            if add_oauth_beta {
+                b = b.header("anthropic-beta", OAUTH_BETA);
+            }
+            b.send()
+        };
+
+        let resp = match &backend.auth {
+            BackendAuth::Oauth { .. } => {
+                let token = current_oauth_token(backend).await;
+                let first = send_once(format!("Bearer {token}"), true, forward_body.clone()).await;
+                match first {
+                    Ok(r) if r.status().as_u16() == 401 => {
+                        tracing::warn!(%backend_name, "got 401, reloading credentials and retrying");
+                        let fresh = reload_token(backend).await;
+                        match send_once(format!("Bearer {fresh}"), true, forward_body.clone()).await
+                        {
+                            Ok(r) if r.status().as_u16() != 401 => r,
+                            Ok(_) | Err(_) => {
+                                tracing::warn!(%backend_name, "still failing after token refresh, trying next");
                                 continue;
                             }
-                            tracing::info!(%backend_name, %s, "response (after token refresh)");
-                            return stream_response(r).await;
-                        }
-                        _ => {
-                            tracing::warn!(%backend_name, "still failing after token refresh, trying next");
-                            continue;
                         }
                     }
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(%backend_name, "request error: {e}");
+                        continue;
+                    }
                 }
-                if state.config.failover.triggers.contains(&status) {
-                    tracing::warn!(%backend_name, %status, "trigger status, trying next backend");
-                    state.metrics.set_last_status(backend_name, status);
-                    state.metrics.inc_failovers();
-                    continue;
+            }
+            BackendAuth::ApiKey { key } => {
+                let key_value = key.read().await.clone();
+                match send_once(format!("Bearer {key_value}"), false, forward_body.clone()).await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(%backend_name, "request error: {e}");
+                        continue;
+                    }
                 }
-                tracing::info!(%backend_name, %status, "response");
-                state.metrics.set_last_status(backend_name, status);
-                return stream_response(resp).await;
             }
-            Err(e) => {
-                tracing::warn!(%backend_name, "request error: {e}");
-                continue;
-            }
+        };
+
+        let status = resp.status().as_u16();
+        if state.config.failover.triggers.contains(&status) {
+            tracing::warn!(%backend_name, %status, "trigger status, trying next backend");
+            state.metrics.set_last_status(backend_name, status);
+            state.metrics.inc_failovers();
+            continue;
         }
+        tracing::info!(%backend_name, %status, "response");
+        state.metrics.set_last_status(backend_name, status);
+        return stream_response(resp).await;
     }
 
     tracing::error!("all backends exhausted");
     StatusCode::BAD_GATEWAY.into_response()
 }
 
+/// Return the current OAuth access token, reloading from disk if expired.
+/// Panics if called on a non-OAuth backend.
+async fn current_oauth_token(backend: &BackendState) -> String {
+    let BackendAuth::Oauth { token, .. } = &backend.auth else {
+        unreachable!("current_oauth_token called on non-oauth backend");
+    };
+    let cred = token.read().await;
+    if cred.is_expired() {
+        drop(cred);
+        tracing::info!("token expired, reloading credentials");
+        reload_token(backend).await
+    } else {
+        cred.access_token.clone()
+    }
+}
+
 /// Re-read the credentials file and update the stored token. Returns the fresh access token.
+/// Panics if called on a non-OAuth backend.
 async fn reload_token(backend: &BackendState) -> String {
-    match load_credentials(&backend.credentials_file) {
+    let BackendAuth::Oauth { credentials_file, token } = &backend.auth else {
+        unreachable!("reload_token called on non-oauth backend");
+    };
+    match load_credentials(credentials_file) {
         Ok(cred) => {
-            let token = cred.access_token.clone();
-            *backend.token.write().await = cred;
-            token
+            let t = cred.access_token.clone();
+            *token.write().await = cred;
+            t
         }
         Err(e) => {
-            tracing::error!("failed to reload credentials from {}: {e}", backend.credentials_file);
-            backend.token.read().await.access_token.clone()
+            tracing::error!("failed to reload credentials from {credentials_file}: {e}");
+            token.read().await.access_token.clone()
+        }
+    }
+}
+
+/// Rewrite the `model` field of a JSON request body. Silently returns the
+/// original bytes if the body is not JSON or does not contain a `model` key —
+/// non-Messages endpoints (e.g. `/v1/models`) shouldn't be mangled.
+fn rewrite_model(body: &Bytes, map: &HashMap<String, String>) -> Bytes {
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    let Some(model) = v.get("model").and_then(|m| m.as_str()) else {
+        return body.clone();
+    };
+    let Some(replacement) = map.get(model) else {
+        return body.clone();
+    };
+    tracing::debug!(from = %model, to = %replacement, "rewriting model id");
+    v["model"] = serde_json::Value::String(replacement.clone());
+    match serde_json::to_vec(&v) {
+        Ok(b) => Bytes::from(b),
+        Err(e) => {
+            tracing::warn!("model rewrite reserialize failed: {e}");
+            body.clone()
         }
     }
 }
@@ -181,7 +243,12 @@ fn strip_auth_headers(headers: &HeaderMap) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, value) in headers {
         match name.as_str().to_ascii_lowercase().as_str() {
-            "authorization" | "x-api-key" | "host" | "transfer-encoding" => continue,
+            // content-length is stripped because we may rewrite the body (model-id
+            // substitution for api_key backends); reqwest recomputes it from the
+            // actual bytes we pass to .body().
+            "authorization" | "x-api-key" | "host" | "transfer-encoding" | "content-length" => {
+                continue
+            }
             _ => {
                 out.insert(name.clone(), value.clone());
             }

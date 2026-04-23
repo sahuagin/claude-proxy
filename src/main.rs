@@ -10,7 +10,7 @@ mod mgmt;
 mod metrics;
 mod proxy;
 
-use proxy::{AppState, BackendState};
+use proxy::{AppState, BackendAuth, BackendState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -30,22 +30,40 @@ async fn main() -> Result<()> {
 
     let mut backends = HashMap::new();
     for backend in &cfg.backends {
-        tracing::info!("loading credentials for backend '{}'", backend.name);
-        let cred = config::load_credentials(&backend.credentials_file)
-            .with_context(|| format!("loading credentials for backend '{}'", backend.name))?;
-        if cred.is_expired() {
-            tracing::warn!(
-                "token for '{}' is already expired — will reload on first request",
-                backend.name
-            );
-        }
-        backends.insert(
-            backend.name.clone(),
-            Arc::new(BackendState {
-                credentials_file: backend.credentials_file.clone(),
-                token: RwLock::new(cred),
-            }),
-        );
+        let auth = match backend.auth {
+            config::AuthConfig::Oauth => {
+                let credentials_file = backend.credentials_file.as_ref().with_context(|| {
+                    format!("backend '{}' auth=oauth requires credentials_file", backend.name)
+                })?;
+                tracing::info!("loading OAuth credentials for backend '{}'", backend.name);
+                let cred = config::load_credentials(credentials_file).with_context(|| {
+                    format!("loading credentials for backend '{}'", backend.name)
+                })?;
+                if cred.is_expired() {
+                    tracing::warn!(
+                        "token for '{}' is already expired — will reload on first request",
+                        backend.name
+                    );
+                }
+                BackendAuth::Oauth {
+                    credentials_file: credentials_file.clone(),
+                    token: RwLock::new(cred),
+                }
+            }
+            config::AuthConfig::ApiKey => {
+                let key = backend.key.as_ref().with_context(|| {
+                    format!(
+                        "backend '{}' auth=api_key requires key (literal or $REF:)",
+                        backend.name
+                    )
+                })?;
+                tracing::info!("loaded API key for backend '{}'", backend.name);
+                BackendAuth::ApiKey {
+                    key: RwLock::new(key.trim().to_string()),
+                }
+            }
+        };
+        backends.insert(backend.name.clone(), Arc::new(BackendState { auth }));
     }
 
     let faults = cfg.fault_injection.as_map();
